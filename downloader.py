@@ -25,6 +25,7 @@ import sys
 import os
 import json
 import logging
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from yt_dlp import YoutubeDL
@@ -112,7 +113,7 @@ def search_youtube(query, max_results=10, retries=3):
     return []
 
 
-def download_one(options, retries=3):
+def download_one(options):
     url = options['url']
     outdir = options.get('outdir', 'downloads')
     fmt = options.get('format', 'best')
@@ -120,6 +121,12 @@ def download_one(options, retries=3):
     playlist = options.get('playlist', False)
     subtitles = options.get('subtitles', False)
     thumbnail = options.get('thumbnail', False)
+    dry_run = options.get('dry_run', False)
+    no_overwrites = options.get('no_overwrites', False)
+    retries = int(options.get('retries', 3))
+    timeout = int(options.get('timeout', 15))
+    user_agent = options.get('user_agent')
+    proxy = options.get('proxy')
 
     ensure_dir(outdir)
 
@@ -128,8 +135,16 @@ def download_one(options, retries=3):
         'noplaylist': not playlist,
         'progress_hooks': [progress_hook],
         'quiet': False,
-        'retries': retries,
+        'socket_timeout': timeout,
     }
+
+    if no_overwrites:
+        ydl_opts['nooverwrites'] = True
+    if user_agent:
+        # set HTTP header User-Agent
+        ydl_opts['http_headers'] = {'User-Agent': user_agent}
+    if proxy:
+        ydl_opts['proxy'] = proxy
 
     if subtitles:
         ydl_opts['writesubtitles'] = True
@@ -150,14 +165,51 @@ def download_one(options, retries=3):
     else:
         ydl_opts['format'] = fmt
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        logging.info(f"Successfully downloaded {url}")
-    except Exception as e:
-        msg = f"Download failed for {url}: {e}"
-        print(msg)
-        logging.error(msg)
+    # Dry run: only show what would be downloaded
+    if dry_run:
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info is None:
+                    print(f"[DRY RUN] No info for {url}")
+                    return
+                if 'entries' in info and info['entries']:
+                    for e in info['entries']:
+                        try:
+                            name = ydl.prepare_filename(e)
+                        except Exception:
+                            name = e.get('title') or '<unknown>'
+                        print(f"[DRY RUN] {e.get('title')} -> {name}")
+                else:
+                    try:
+                        name = ydl.prepare_filename(info)
+                    except Exception:
+                        name = info.get('title') or '<unknown>'
+                    print(f"[DRY RUN] {info.get('title')} -> {name}")
+            return
+        except Exception as e:
+            print(f"Dry-run failed for {url}: {e}")
+            logging.error(f"Dry-run failed for {url}: {e}")
+            return
+
+    attempt = 0
+    while attempt < retries:
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            logging.info(f"Successfully downloaded {url}")
+            return
+        except Exception as e:
+            attempt += 1
+            msg = f"Download failed for {url} (attempt {attempt}/{retries}): {e}"
+            print(msg)
+            logging.error(msg)
+            if attempt < retries:
+                sleep_time = 2 ** attempt
+                print(f"Retrying in {sleep_time}s...")
+                time.sleep(sleep_time)
+            else:
+                print(f"Giving up on {url} after {retries} attempts")
 
 
 def cli_mode(args, config):
@@ -207,6 +259,12 @@ def cli_mode(args, config):
                 'playlist': args.playlist,
                 'subtitles': args.subtitles,
                 'thumbnail': args.thumbnail,
+                'dry_run': args.dry_run,
+                'no_overwrites': args.no_overwrites,
+                'retries': args.retries,
+                'timeout': args.timeout,
+                'user_agent': args.user_agent,
+                'proxy': args.proxy,
             }
             futures.append(ex.submit(download_one, options))
 
@@ -227,8 +285,12 @@ def build_parser():
     p.add_argument('-c', '--concurrent', type=int, default=1, help='Number of concurrent downloads')
     p.add_argument('-s', '--subtitles', action='store_true', help='Download subtitles')
     p.add_argument('-t', '--thumbnail', action='store_true', help='Download thumbnail')
-
-    # Extra features
+    p.add_argument('--dry-run', dest='dry_run', action='store_true', help='Show what would be downloaded without saving files')
+    p.add_argument('--no-overwrites', dest='no_overwrites', action='store_true', help='Do not overwrite existing files')
+    p.add_argument('--retries', dest='retries', type=int, default=3, help='Number of download retries on failure')
+    p.add_argument('--timeout', dest='timeout', type=int, default=15, help='Socket timeout in seconds')
+    p.add_argument('--user-agent', dest='user_agent', help='Custom User-Agent header')
+    p.add_argument('--proxy', dest='proxy', help='Proxy URL (e.g., socks5://127.0.0.1:9050)')
     p.add_argument('--list-formats', dest='list_formats', action='store_true', help='List available formats for the first URL')
     p.add_argument('--search', dest='search', action='store_true', help='Search YouTube (use --search-query)')
     p.add_argument('--search-query', dest='search_query', help='Query for YouTube search')
